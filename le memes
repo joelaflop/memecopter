@@ -1,3 +1,523 @@
-voidsetup()
-{
-}
+
+/*
+CURRENT TASKS
+ -can we come up with something that speeds up motors by increasing Z
+     --using Z w/ PID autp... as opposed to current throt increments
+*/
+#include <Servo.h>       //used with motors
+#include <Wire.h>        //I2C(Masters + Slaves) communication
+#define accel (0x53)     //ADXL345 accel device address name thing
+#include <PID_v1.h>
+//#include <LiquidCrystal.h>
+
+//LiquidCrystal lcd(12,11,5,4,3,2);              //original setup
+//LiquidCrystal lcd(2,4,7,8,12,13);              //all digital pins
+
+      Servo esc1, esc2, esc3, esc4;              //names the 4 motors
+      double zeromotor = 30;                      //zero value for motor
+     
+      byte buff[6] ;                             //6 bytes for saving data 
+                                                 //that is read from the accel
+      double throt1, throt2, throt3, throt4;     //individual throttles, PID
+      double hover = 60;                        //cancel gravity
+      double shift = 70;                        // hover when shifting
+      double lift = 80;                         //lift off value
+      double spinhover = 80;                    //spinning value
+      int start = 30;                            //starting/arming value
+      double setptx, setpty, setptz;             //aim points for axis
+      double X, Y, Z;                            //measure of accel on all axis
+      double x, y, z, zz;                        //measure of degree tilt
+      unsigned long MS = millis();               //counts from upload in millis
+      unsigned long mills = millis();            //this one for manuevers
+                                               
+                                                 //PID setsup http://goo.gl/wPzRhg
+      PID m1(&y, &throt1, &setpty, .4, .2, .1, REVERSE);
+      PID m2(&x, &throt2, &setptx, .4, .2, .1, REVERSE);
+      PID m3(&y, &throt3, &setpty, .4, .2, .1, DIRECT);
+      PID m4(&x, &throt4, &setptx, .4, .2, .1, DIRECT);
+
+  
+void setup()
+    {
+        //lcd.begin(16, 2);               //curser setting to start LCD
+        
+        setptx = 3;                       //x & y degrees when held flat
+        setpty = -.5;                     //setpoints we AIM for
+        m1.SetMode(AUTOMATIC);            //sets PID to be computed constant
+        m2.SetMode(AUTOMATIC);            // or automatically
+        m3.SetMode(AUTOMATIC);
+        m4.SetMode(AUTOMATIC);
+        
+        esc1.attach(3);                   // 3,5,6,9 being the PWM pins
+        esc2.attach(5);
+        esc3.attach(6);
+        esc4.attach(9);
+      
+        Wire.begin();                     // enter communication wire I2C
+                
+        Serial.begin(38400);              //serial start up (38400 baud)
+                                          //Turning on + configure the accel
+        writeit(accel, 0x2d, 0);          //turn on powercontrol
+        //writeit(accel, 0x2D, 16);       //put on standby, not needed
+        writeit(accel, 0x31, 0x0b);       //+- 16g mode
+        //writeit(accel, 0x09, 0x10);
+        writeit(accel, 0x2D, 8);          //put on measuement ready
+        writeit(accel, 0x1E, 3);          //    X    offset values
+        writeit(accel, 0x1F, 0);          //    Y    used to readjust for
+        writeit(accel, 0x20, 0);          //    Z    accel error
+        
+        arming();                         //arming procedure, run once
+    }
+
+
+void loop()
+   {
+      m4.Compute();                    //computes the PID's output (looped)
+      m3.Compute();
+      m2.Compute();
+      m1.Compute();
+      
+      updatexyz();                      //ALL FUNCTION DEFINTITIONS TO FOLLOW               
+      safety();
+      takeoffboys();                    //litteraly taking off
+      transition();
+      chill();
+      land();
+      
+      //LCDboys();
+      //lcd.clear();                    //should be in every loop********
+
+    }
+
+//=========================================================================
+//==========================le memes(functions)============================
+//=========================================================================
+  void updatexyz()
+      {
+        if((millis()-MS)>20)
+        {                                  //Update every 20 milisecond
+          convertxyz();  
+          MS=millis();                     //reset MS to millis count-up
+        }
+        //LCD();                           //update LCD as well
+      }
+  /*void LCD()                             //prints tilt degrees to LCD
+  
+  {
+    lcd.display(); 
+    lcd.setCursor(0,1);
+    int xdeg = x;
+    lcd.print(x);
+    int ydeg = y;
+    lcd.setCursor(6,1);
+    lcd.print(y);
+    int zdeg = z;
+    lcd.setCursor(12,1);
+    lcd.print(z);
+        
+    lcd.setCursor(3,0);
+    lcd.print("memecopter");
+        
+    delay(200);
+  }*/
+
+  void convertxyz()
+      {                                    //http://goo.gl/T8U0sR
+        definexyz(); 
+        x = (atan((X)/(sqrt(sq(Y) + sq(Z)))))*(180/PI);
+        y = (atan((Y)/(sqrt(sq(X) + sq(Z)))))*(180/PI);
+        z = (atan((Z)/(sqrt(sq(X) + sq(Y)))))*(180/PI);
+        zz = (atan((sqrt(sq(X) + sq(Y)))/(Z)))*(180/PI);
+      }
+ 
+  void definexyz()
+      {
+        int regadd = 0x32;                //first axis-accel-data register, will  
+                                          //count up from here to get all 6 six
+        readit(accel, regadd, 6, buff);   //read the accel data from the ADXL345
+      
+               //each axis reading comes in 10 bit resolution --> 2 bytes
+               //we are converting both bytes into one int combineing w/ bitwise
+         X = (((int)buff[1]) << 8) | buff[0];   
+         Y = (((int)buff[3]) << 8) | buff[2];
+         Z = (((int)buff[5]) << 8) | buff[4];
+              
+      }
+  void writeit(int accell, byte add, byte val) 
+      {
+         Wire.beginTransmission(accell);       //begin tranfer 
+         Wire.write(add);                      // send/find le address
+         Wire.write(val);                      // send value to write at address
+         Wire.endTransmission(); //end transfer
+      }
+    
+                  //reads num bytes starting from address register on device 
+                  //int to buff array, mulitple byte reading
+  void readit(int accell, byte add, int num, byte buff[])
+      {
+        Wire.beginTransmission(accell);       //start transfer to accel
+        Wire.write(add);                      //sends address to read from
+        Wire.endTransmission();               //end transmission
+      
+        Wire.beginTransmission(accell);       //start transfer
+        Wire.requestFrom(accell, num);        //request 6 bytes
+      
+        int i = 0;
+          while(Wire.available())             //constantly recieve the values 
+          { 
+            buff[i] = Wire.read();            // receive le byte, never stop
+            i++;
+          }
+        Wire.endTransmission();               //end transfer
+      }
+      
+  void safety()                              
+      {                                       
+        if(x > 45 || x < -45 || y > 45 || y < -45/* || ( z > 1 && z < 60)*/)
+        {                                     //if any of the axis tilt
+          while(true)
+          {
+            esc1.write(zeromotor);            //too much turn it all off
+            esc2.write(zeromotor);
+            esc3.write(zeromotor);
+            esc4.write(zeromotor);
+          
+            Serial.write("OFF");
+            Serial.println();
+           /* lcd.setCursor(0,1);
+            lcd.print("0, 0, 0");
+            lcd.clear();*/
+          }
+        }
+      }
+  void arming()                                // arming procedure
+    {  //http://techvalleyprojects.blogspot.com/2012/06/arduino-control-escmotor-tutorial.html
+        Serial.println();
+        Serial.write("starting all motors up");
+        Serial.println();
+       /* esc1.write(zeromotor);                
+        esc2.write(zeromotor);
+        esc3.write(zeromotor);
+        esc4.write(zeromotor);*/
+        
+          delay(3000);
+        esc1.write(start);
+        esc2.write(start);
+        esc3.write(start);
+        esc4.write(start);
+          delay(3000);
+        Serial.write("Done");
+        Serial.println();
+    }
+  void takeoffboys()                           //decrease ratios-> 
+    {                                          //update more often
+      for(int Tthrot = start; Tthrot < lift; Tthrot++)                    
+        {
+          updatexyz();                         //all for's must convertxyz
+          m4.Compute();                        //& readjust PID's
+          m3.Compute(); 
+          m2.Compute();
+          m1.Compute();
+          
+          esc1.write(Tthrot + throt1);
+          esc2.write(Tthrot + throt2);
+          esc3.write(Tthrot + throt3);
+          esc4.write(Tthrot + throt4);
+          
+          safety();
+          
+          Serial.print(x);
+          Serial.write(",  ");
+          Serial.print(y);
+          Serial.write(",  ");
+          Serial.print(z);
+          Serial.write("  ||  "); 
+          Serial.print(zz);
+          Serial.write("            ");
+          
+         
+          Serial.print(Tthrot + throt1);
+          Serial.write(",  ");
+          Serial.print(Tthrot + throt2);
+          Serial.write(",  ");
+          Serial.print(Tthrot + throt3);
+          Serial.write(",  ");
+          Serial.print(Tthrot + throt4);
+          Serial.println();
+          
+          //lcd.clear();
+          
+          delay(150);
+        }
+    }
+  void transition()                           //go from lift off to chilling
+    { 
+      for(int Vthrot = lift; Vthrot > hover; Vthrot--)
+        {
+          updatexyz();
+          m4.Compute();
+          m3.Compute();
+          m2.Compute();
+          m1.Compute();
+          
+          esc1.write(Vthrot + throt1);
+          esc2.write(Vthrot + throt1);
+          esc3.write(Vthrot + throt1);
+          esc4.write(Vthrot + throt1);
+          safety();
+            
+          Serial.write("(");
+          Serial.print(x);
+          Serial.write(",  ");
+          Serial.print(y);
+          Serial.write(",  ");
+          Serial.print(z);
+          Serial.write("  ||  "); 
+          Serial.print(zz);
+          Serial.write(")           ");
+        
+          Serial.print(Vthrot + throt1);
+          Serial.write(",  ");
+          Serial.print(Vthrot + throt2);
+          Serial.write(",  ");
+          Serial.print(Vthrot + throt3);
+          Serial.write(",  ");
+          Serial.print(Vthrot + throt4);
+          Serial.println();
+         
+          //lcd.clear();
+          delay(150);
+        }
+     }
+  void chill()
+    {
+    while(millis() < 30000)                    //chill untill 30 secs passed
+        {
+          updatexyz();
+          m4.Compute();
+          m3.Compute();
+          m2.Compute();
+          m1.Compute();
+                
+          esc1.write(hover + throt1);
+          esc2.write(hover + throt2);
+          esc3.write(hover + throt3);
+          esc4.write(hover + throt4);
+          
+          safety();
+            
+          Serial.write("(");
+          Serial.print(x);
+          Serial.write(",  ");
+          Serial.print(y);
+          Serial.write(",  ");
+          Serial.print(z);
+          Serial.write("  ||  "); 
+          Serial.print(zz);
+          Serial.write(")           ");
+        
+          Serial.print(hover + throt1);
+          Serial.write(",  ");
+          Serial.print(hover + throt2);
+          Serial.write(",  ");
+          Serial.print(hover + throt3);
+          Serial.write(",  ");
+          Serial.print(hover + throt4);
+          Serial.println();
+             
+           // lcd.clear();
+        }
+    }
+  void land()
+    {
+      if(millis() > 30000)              //after 30 secs bring all motors to off
+      {
+        for(int Lthrot = hover; Lthrot > start; Lthrot = Lthrot - 1) 
+                                                       
+          {
+            updatexyz();
+            m4.Compute();
+            m3.Compute();
+            m2.Compute();
+            m1.Compute();
+            
+            esc1.write(Lthrot + throt1);
+            esc2.write(Lthrot + throt2);
+            esc3.write(Lthrot + throt3);
+            esc4.write(Lthrot + throt4);
+            
+            safety();
+            
+            Serial.print(x);
+            Serial.write(",  ");
+            Serial.print(y);
+            Serial.write(",  ");
+            Serial.print(z);
+            Serial.write("  ||  "); 
+            Serial.print(zz);
+            Serial.write("            ");
+            
+            Serial.print(Lthrot + throt1);
+            Serial.write(",  ");
+            Serial.print(Lthrot + throt2);
+            Serial.write(",  ");
+            Serial.print(Lthrot + throt3);
+            Serial.write(",  ");
+            Serial.print(Lthrot + throt4);
+            Serial.println();
+            
+            // lcd.clear();
+            
+            delay(10);
+          }
+         while(true)
+          {
+            esc1.write(zeromotor);
+            esc2.write(zeromotor);
+            esc3.write(zeromotor);
+            esc4.write(zeromotor);
+          
+            Serial.write("0, 0, 0,");
+            Serial.println();
+            delay(500);
+          }
+       }
+    }
+  void spinny()           //so increase opposite motors only, to spin
+    {
+      for(int clockspin = hover; clockspin < spinhover; clockspin++)
+        {
+          updatexyz();
+          m4.Compute();
+          m3.Compute();
+          m2.Compute();
+          m1.Compute();
+          
+          esc1.write(clockspin + throt1);
+          esc2.write(hover + throt2);
+          esc3.write(clockspin + throt3);
+          esc4.write(hover + throt4);
+          
+          safety();
+          
+          Serial.print(x);
+          Serial.write(",  ");
+          Serial.print(y);
+          Serial.write(",  ");
+          Serial.print(z);
+          Serial.write("  ||  "); 
+          Serial.print(zz);
+          Serial.write("            ");
+            
+          Serial.print(clockspin + throt1);
+          Serial.write(",  ");
+          Serial.print(hover + throt2);
+          Serial.write(",  ");
+          Serial.print(clockspin + throt3);
+          Serial.write(",  ");
+          Serial.print(hover + throt4);
+          Serial.println();
+        }
+      for(int countspin = hover; countspin < spinhover; countspin++)
+        {
+          updatexyz();
+          m4.Compute();
+          m3.Compute();
+          m2.Compute();
+          m1.Compute();
+          
+          esc1.write(hover + throt1);
+          esc2.write(countspin + throt2);
+          esc3.write(hover + throt3);
+          esc4.write(countspin + throt4);
+          
+          safety();
+          
+          Serial.print(x);
+          Serial.write(",  ");
+          Serial.print(y);
+          Serial.write(",  ");
+          Serial.print(z);
+          Serial.write("  ||  "); 
+          Serial.print(zz);
+          Serial.write("            ");
+            
+          Serial.print(hover + throt1);
+          Serial.write(",  ");
+          Serial.print(countspin + throt2);
+          Serial.write(",  ");
+          Serial.print(hover + throt1);
+          Serial.write(",  ");
+          Serial.print(countspin + throt4);
+          Serial.println();
+        }
+    }
+  void RtLf()      //increase just one motor, might need all 4...vectors
+    {              //manuever right then left by increasing proper motor
+      for(int movert = hover; movert < shift; movert++)
+        {
+          updatexyz();
+          m4.Compute();
+          m3.Compute();
+          m2.Compute();
+          m1.Compute();
+          
+          esc1.write(hover + throt1);
+          esc2.write(hover + throt2);
+          esc3.write(hover + throt3);
+          esc4.write(movert + throt4);
+          
+          safety();
+          
+          Serial.print(x);
+          Serial.write(",  ");
+          Serial.print(y);
+          Serial.write(",  ");
+          Serial.print(z);
+          Serial.write("  ||  "); 
+          Serial.print(zz);
+          Serial.write("            ");
+            
+          Serial.print(hover + throt1);
+          Serial.write(",  ");
+          Serial.print(hover + throt2);
+          Serial.write(",  ");
+          Serial.print(hover + throt1);
+          Serial.write(",  ");
+          Serial.print(movert + throt4);
+          Serial.println();
+        }                      //we need a transition??
+      for(int movelf = hover; movelf < shift; movelf++)
+        {
+          updatexyz();
+          m4.Compute();
+          m3.Compute();
+          m2.Compute();
+          m1.Compute();
+          
+          esc1.write(hover + throt1);
+          esc2.write(hover + throt2);
+          esc3.write(hover + throt3);
+          esc4.write(movelf + throt4);
+          
+          safety();
+          
+          Serial.print(x);
+          Serial.write(",  ");
+          Serial.print(y);
+          Serial.write(",  ");
+          Serial.print(z);
+          Serial.write("  ||  "); 
+          Serial.print(zz);
+          Serial.write("            ");
+            
+          Serial.print(hover + throt1);
+          Serial.write(",  ");
+          Serial.print(hover + throt2);
+          Serial.write(",  ");
+          Serial.print(hover + throt1);
+          Serial.write(",  ");
+          Serial.print(movelf + throt4);
+          Serial.println();
+        }
+    }
